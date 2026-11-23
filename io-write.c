@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <mach.h>
+#include <hurd/pager.h>
 
 error_t
 S_io_write (struct protid *protid,
@@ -36,6 +37,7 @@ S_io_write (struct protid *protid,
   error_t err;
   struct peropen *po;
   struct node *np;
+  struct pager *pager;
   uint64_t start;
   uint32_t nwritten;
 
@@ -67,6 +69,39 @@ S_io_write (struct protid *protid,
   /* Preemptively invalidate the stat cache.  */
   np->last_stat = 0;
 
+  /* Coherence with the kernel page cache.
+
+     Direct writes go to the server through the io fid, while a
+     writable pager may hold dirty pages for the same range in the
+     kernel.  Policy choice: flush and drop the affected kernel pages
+     before the write.  pager_return_some writes any dirty pages back
+     and then frees the kernel copies, so a fault after this write
+     refetches the fresh server data and ordering is preserved.  A
+     plain invalidate without write back would lose the dirty pager
+     pages, which is why return and not flush is used here.
+
+     This runs under the node lock.  That is safe because the pager
+     callbacks never take it, see pager.c.  */
+  pager = np->pager;
+  if (pager && np->pager_writable)
+    {
+      /* Round the range out to whole pages.  The pager address space
+         is 32 bit, so clamp a range that reaches past 4 GiB.  */
+      uint64_t flush_to = ((uint64_t) start + datalen + vm_page_size - 1)
+                          & ~((uint64_t) vm_page_size - 1);
+      uint64_t max_to = (uint64_t) ~(vm_offset_t) 0 - (vm_page_size - 1);
+      uint64_t flush_from = (uint64_t) start
+                            & ~((uint64_t) vm_page_size - 1);
+
+      if (flush_to > max_to)
+        flush_to = max_to;
+
+      ports_port_ref (pager);
+      if (flush_to > flush_from)
+        pager_return_some (pager, flush_from, flush_to - flush_from, TRUE);
+      ports_port_deref (pager);
+    }
+
   /* Write-behind for unsynced opens.  O_SYNC and O_DSYNC alias the
      same bit on the Hurd, so one test covers both.  The flags arrive
      with the open call and live in user_open_flags.  The
@@ -95,6 +130,10 @@ S_io_write (struct protid *protid,
       *amount = datalen;
       if (offset == -1)
         po->offset += datalen;
+
+      /* The write may extend the file, so raise the write-back clip.  */
+      if (start + datalen > (uint64_t) np->pager_size)
+        np->pager_size = start + datalen;
       goto out;
     }
 
@@ -113,6 +152,10 @@ S_io_write (struct protid *protid,
   *amount = nwritten;
   if (offset == -1)
     po->offset += nwritten;
+
+  /* The write may extend the file, so raise the write-back clip.  */
+  if (start + nwritten > (uint64_t) np->pager_size)
+    np->pager_size = start + nwritten;
 
  out:
   pthread_mutex_unlock (&np->lock);

@@ -45,6 +45,12 @@ S_io_stat (struct protid *pi, io_statbuf_t *statbuf)
 
   np = pi->po->np;
 
+  /* Hold the node lock across the refresh, like the io handlers do.
+     The stat fields are read and written here as one unit, and the
+     write-back clip below is one of the fields that must not race a
+     concurrent update.  */
+  pthread_mutex_lock (&np->lock);
+
   /* Cache stats for up to 5 seconds.  */
   if (time (NULL) <= np->last_stat + 5)
     goto have_stat;
@@ -72,7 +78,7 @@ S_io_stat (struct protid *pi, io_statbuf_t *statbuf)
                     &ctime_sec, &ctime_nsec, &btime_sec, &btime_nsec,
                     &gen, &data_version);
       if (err)
-        return err;
+        goto out;
 
       if (valid_mask & P9_GETATTR_MASK_INO)
         np->stat.st_ino = np->qid.path;
@@ -164,7 +170,7 @@ S_io_stat (struct protid *pi, io_statbuf_t *statbuf)
         {
           /* Make sure to free the partially-filled struct.  */
           p9_stat_free (&s);
-          return err;
+          goto out;
         }
 
       if (long_stat && p9_version < P9_VERSION_2000_U)
@@ -200,11 +206,23 @@ S_io_stat (struct protid *pi, io_statbuf_t *statbuf)
     }
 
   np->last_stat = time (NULL);
+
+  /* A size we just handed out can become the extent of a kernel
+     mapping, and the kernel can hand dirty pages of that whole extent
+     back.  Raise the write-back clip so the pager path never clips
+     below a byte some mapping may legitimately hold.  */
+  if (np->stat.st_size > np->pager_size)
+    np->pager_size = np->stat.st_size;
+
 have_stat:
   *statbuf = np->stat;
 
   if (pi->po->root_qid_path == np->qid.path)
     statbuf->st_mode |= S_IROOT;
 
-  return 0;
+  err = 0;
+out:
+  pthread_mutex_unlock (&np->lock);
+
+  return err;
 }

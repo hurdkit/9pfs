@@ -98,6 +98,22 @@ struct node
   char *path;
   struct pager *pager;
   int pager_fid;
+  /* Whether the pager fid is open for writing, so kernel pages are
+     supplied writable and dirty pages come back through
+     pager_write_pages.  Set under the node lock when the pager fid is
+     opened or upgraded, and only ever cleared with the pager itself.
+     Read without the lock from the pager callbacks.  */
+  int pager_writable;
+  /* High water mark of the file sizes this translator has served or
+     caused.  Pager write-back clips page writes at this limit so the
+     garbage tail of the last page never extends the file.  It grows
+     monotonically, so a lock free read in the pager callbacks always
+     sees a limit at least as large as any size a mapping was created
+     with, which is the range the kernel can hand back dirty pages
+     for.  S_file_set_size alone drops it, after flushing the range
+     being cut.  A single aligned 64 bit word, so the read cannot
+     tear.  */
+  loff_t pager_size;
 
   struct node *parent;
   struct node *children;

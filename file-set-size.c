@@ -23,6 +23,65 @@
 #include "9p-rpc.h"
 #include "fs_S.h"
 #include <errno.h>
+#include <hurd/pager.h>
+#include <mach.h>
+
+/* Push the kernel page cache of NP in line with a new file size.
+   Called with the node lock held.  Growth only raises the write-back
+   clip.  A shrink also has to clear the pages of the range being
+   cut, or a write back of a stale dirty page would resurrect the
+   truncated data.  */
+static void
+pager_resize (struct node *np, loff_t new_size)
+{
+  struct pager *pager = np->pager;
+  loff_t old_size = np->pager_size;
+
+  if (!pager)
+    {
+      np->pager_size = new_size;
+      return;
+    }
+
+  if (new_size >= old_size)
+    {
+      np->pager_size = new_size;
+      return;
+    }
+
+  ports_port_ref (pager);
+
+  /* Drop the clip before any page goes back, so the partial page that
+     holds the new end writes only its valid prefix.  The tail bytes
+     of that page would otherwise re-extend the file with garbage.
+     Any write back already queued when the clip drops still writes to
+     the old limit, and those bytes then precede the size request on
+     the connection, so the server applies them first and the
+     truncate last.  The final size is correct either way.  */
+  np->pager_size = new_size;
+
+  /* Write the partial page back and free it, so its valid prefix
+     survives and its tail does not linger as stale kernel data.  */
+  pager_return_some (pager, trunc_page ((vm_offset_t) new_size),
+                     vm_page_size, TRUE);
+
+  /* Free the whole pages past the new end without writing them, they
+     hold no valid data any more.  A following fault reads the shorter
+     file and zero fills the tail.  */
+  {
+    vm_offset_t from = round_page ((vm_offset_t) new_size);
+    uint64_t to = ((uint64_t) old_size + vm_page_size - 1)
+                  & ~((uint64_t) vm_page_size - 1);
+    uint64_t max_to = (uint64_t) ~(vm_offset_t) 0 - (vm_page_size - 1);
+
+    if (to > max_to)
+      to = max_to;
+    if (to > from)
+      pager_flush_some (pager, from, to - from, TRUE);
+  }
+
+  ports_port_deref (pager);
+}
 
 error_t
 S_file_set_size (struct protid *pi, loff_t new_size)
@@ -42,6 +101,14 @@ S_file_set_size (struct protid *pi, loff_t new_size)
 
   pi->po->np->last_stat = 0;
 
+  pthread_mutex_lock (&pi->po->np->lock);
+  pager_resize (pi->po->np, new_size);
+  pthread_mutex_unlock (&pi->po->np->lock);
+
+  /* Failure of the size request below leaves the server file at the
+     old size while the clip and the kernel pages already match the
+     new one.  Later faults re-read the real server contents, so the
+     error is reported and the two views converge on the next stat.  */
   if (p9_version >= P9_VERSION_2000_L)
     return p9_rpc (P9_SETATTR_REQUEST,
                    "4444488888", pi->walk_fid, P9_SETATTR_MASK_SIZE,

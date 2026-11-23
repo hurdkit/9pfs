@@ -23,12 +23,15 @@
 #include "9p-rpc.h"
 #include "fs_S.h"
 #include <errno.h>
+#include <hurd/pager.h>
 
 error_t
 S_file_sync (struct protid *pi, int wait, int omit_metadata)
 {
   error_t err;
   struct p9_stat s;
+  struct node *np;
+  struct pager *pager;
 
   if (!pi)
     return EOPNOTSUPP;
@@ -36,11 +39,33 @@ S_file_sync (struct protid *pi, int wait, int omit_metadata)
     /* Should we return EROFS?  */
     return 0;
 
-  /* Drain the write-behind queue first.  The outstanding count is
+  np = pi->po->np;
+
+  /* Sync the pager first, before the drain below.  pager_sync makes
+     the kernel write its dirty pages of this node back through
+     pager_write_pages, which queues them as background T-writes.
+     With wait set it returns once every write back has been sent.
+     The extent it covers comes from pager_report_extent, which uses
+     the size high water mark, so every dirty page of the node is
+     included.  */
+  pthread_mutex_lock (&np->lock);
+  pager = np->pager;
+  if (pager)
+    ports_port_ref (pager);
+  pthread_mutex_unlock (&np->lock);
+
+  if (pager)
+    {
+      pager_sync (pager, TRUE);
+      ports_port_deref (pager);
+    }
+
+  /* Drain the write-behind queue next.  The outstanding count is
      global, so this waits for every fire-and-forget write in the
-     filesystem, not just this file.  That is the scope choice made
-     in 9p-rpc.c.  Sending the sync request afterwards guarantees the
-     server sees the writes before the sync.  */
+     filesystem, not just this file, including the pager flushes sent
+     just above.  That is the scope choice made in 9p-rpc.c.  Sending
+     the sync request afterwards guarantees the server sees the
+     writes before the sync.  */
   p9_wait_bg_writes ();
 
 
